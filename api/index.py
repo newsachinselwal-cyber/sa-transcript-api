@@ -1,9 +1,8 @@
 from flask import Flask, request, jsonify
 from youtube_transcript_api import YouTubeTranscriptApi
-import re
+import re, os
 app = Flask(__name__)
 api = YouTubeTranscriptApi()
-LANGS = ["hi","en","es","fr","de","pt","ja","ko","zh","ar","ru","it","bn","ta","te","mr","gu","kn","ml","pa","ur"]
 def vid_id(url):
     for p in [r"(?:youtube\.com/watch\?v=)([a-zA-Z0-9_-]{11})", r"(?:youtu\.be/)([a-zA-Z0-9_-]{11})",
               r"(?:youtube\.com/embed/)([a-zA-Z0-9_-]{11})", r"(?:youtube\.com/shorts/)([a-zA-Z0-9_-]{11})",
@@ -24,6 +23,8 @@ def cors(resp):
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp
 @app.route("/api/extract", methods=["GET","POST","OPTIONS"])
+@app.route("/api/index", methods=["GET","POST","OPTIONS"])
+@app.route("/", methods=["GET"])
 def extract():
     if request.method == "OPTIONS":
         return cors(jsonify({}))
@@ -40,19 +41,46 @@ def extract():
     if not v:
         return cors(jsonify({"error":"Invalid YouTube URL."})), 400
     try:
-        langs = ([lang]+[l for l in LANGS if l!=lang]) if lang else LANGS
-        try:
-            raw = api.fetch(v, languages=langs)
-        except:
-            tl = api.list(v)
-            raw = None
-            for t in tl:
-                raw = t.fetch()
-                break
-        if not raw:
+        # Step 1: List all available transcripts
+        transcript_list = api.list(v)
+        # Step 2: Collect available languages info
+        available = []
+        for t in transcript_list:
+            available.append({
+                "code": t.language_code,
+                "name": t.language,
+                "isGenerated": t.is_generated,
+            })
+        # Step 3: Pick the right transcript
+        chosen = None
+        chosen_info = {}
+        if lang:
+            # User specified a language
+            try:
+                chosen = transcript_list.find_transcript([lang]).fetch()
+                chosen_info = {"code": lang, "isGenerated": False}
+            except:
+                pass
+        if not chosen:
+            # Auto-detect: prefer manual (original) over auto-generated
+            # Manual transcripts = uploaded by creator = original language
+            manual = [t for t in transcript_list if not t.is_generated]
+            generated = [t for t in transcript_list if t.is_generated]
+            if manual:
+                # Manual transcript = original language
+                t = manual[0]
+                chosen = t.fetch()
+                chosen_info = {"code": t.language_code, "name": t.language, "isGenerated": False}
+            elif generated:
+                # Auto-generated = YouTube's speech recognition
+                t = generated[0]
+                chosen = t.fetch()
+                chosen_info = {"code": t.language_code, "name": t.language, "isGenerated": True}
+        if not chosen:
             return cors(jsonify({"error":"No subtitles found."})), 404
+        # Step 4: Build response
         segs = []
-        for e in raw:
+        for e in chosen:
             txt = (e.text if hasattr(e,"text") else e.get("text","")).strip()
             st = e.start if hasattr(e,"start") else e.get("start",0)
             dur = e.duration if hasattr(e,"duration") else e.get("duration",0)
@@ -66,9 +94,19 @@ def extract():
             st = s["offsetMs"]/1000
             srt_lines.append(f"{i+1}\n{srt_t(st)} --> {srt_t(st+s['duration']/1000)}\n{s['text']}\n")
         srt = "\n".join(srt_lines)
-        return cors(jsonify({"videoId":v,"segmentCount":len(segs),"segments":segs,"fullText":full,"srt":srt}))
+        return cors(jsonify({
+            "videoId": v,
+            "language": chosen_info,
+            "availableLanguages": available,
+            "segmentCount": len(segs),
+            "segments": segs,
+            "fullText": full,
+            "srt": srt,
+        }))
     except Exception as e:
         msg = str(e)
-        if "disabled" in msg.lower():
+        if "disabled" in msg.lower() or "TranscriptsDisabled" in msg:
             return cors(jsonify({"error":"Subtitles are disabled for this video."})), 403
+        if "blocking" in msg.lower() or "IpBlocked" in msg or "RequestBlocked" in msg:
+            return cors(jsonify({"error":"YouTube is temporarily blocking requests. Please try again later."})), 429
         return cors(jsonify({"error":f"Failed: {msg[:200]}"})), 500
